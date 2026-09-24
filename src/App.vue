@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 
 type Field = {
   key: string;
@@ -13,7 +13,28 @@ type RecordItem = {
   status: string;
   notes: string;
   createdAt: string;
-  [key: string]: string | number;
+  expectedArrival?: string;
+  restockManager?: string;
+  [key: string]: string | number | undefined;
+};
+
+type Transition = {
+  key: string;
+  from: string;
+  to: string;
+  label: string;
+  needsForm?: boolean;
+};
+
+type FlowLog = {
+  id: string;
+  recordId: string;
+  station: string;
+  action: string;
+  from: string;
+  to: string;
+  operator: string;
+  time: string;
 };
 
 const project = {
@@ -36,8 +57,9 @@ const project = {
   "entityLabel": "油站",
   "statuses": [
     "营业中",
-    "暂停营业",
-    "库存紧张"
+    "库存不足",
+    "补货中",
+    "暂停营业"
   ],
   "filters": [
     "全部区域",
@@ -84,19 +106,40 @@ const project = {
       "area": "机场线",
       "stock": 9000,
       "manager": "王站长",
-      "status": "库存紧张",
+      "status": "库存不足",
       "notes": "柴油待补"
     }
   ],
   "metricLabels": [
     "油站数",
     "营业中",
-    "库存紧张"
+    "库存不足"
   ]
 } as const;
 
 const fields = project.fields as readonly Field[];
 const statuses = [...project.statuses];
+
+// 状态机：只允许以下流转。
+// 补货必须登记预计到货时间和负责人；补货中须经到货确认才能恢复营业；暂停营业不能开始补货。
+const transitions: readonly Transition[] = [
+  { key: "low", from: "营业中", to: "库存不足", label: "登记库存不足" },
+  { key: "suspend", from: "营业中", to: "暂停营业", label: "暂停营业" },
+  { key: "restock", from: "库存不足", to: "补货中", label: "登记补货", needsForm: true },
+  { key: "arrive", from: "补货中", to: "营业中", label: "到货确认" },
+  { key: "resume", from: "暂停营业", to: "营业中", label: "恢复营业" }
+];
+
+const logStorageKey = `${project.storageKey}-flow-logs`;
+const operatorStorageKey = `${project.storageKey}-operator`;
+
+// 历史数据里的旧状态名映射到现行状态
+const legacyStatus: Record<string, string> = { 库存紧张: "库存不足" };
+
+function normalizeStatus(status: string) {
+  if (statuses.includes(status)) return status;
+  return legacyStatus[status] ?? statuses[0];
+}
 
 function createBlank() {
   return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
@@ -112,32 +155,42 @@ function loadRecords(): RecordItem[] {
     })) as RecordItem[];
   }
   try {
-    return JSON.parse(raw) as RecordItem[];
+    const stored = JSON.parse(raw) as RecordItem[];
+    return stored.map((record) => ({ ...record, status: normalizeStatus(record.status) }));
+  } catch {
+    return [];
+  }
+}
+
+function loadLogs(): FlowLog[] {
+  try {
+    return JSON.parse(localStorage.getItem(logStorageKey) ?? "[]") as FlowLog[];
   } catch {
     return [];
   }
 }
 
 const records = ref<RecordItem[]>(loadRecords());
+const logs = ref<FlowLog[]>(loadLogs());
 const form = reactive<Record<string, string | number>>(createBlank());
 const note = ref("");
 const filter = ref(project.filters[0]);
+const operator = ref(localStorage.getItem(operatorStorageKey) || "值班员");
+const restockTarget = ref<RecordItem | null>(null);
+const restockForm = reactive({ expectedArrival: "", manager: "" });
+
+watch(operator, (value) => localStorage.setItem(operatorStorageKey, value));
 
 const filteredRecords = computed(() => {
   if (filter.value.startsWith("全部")) return records.value;
   return records.value.filter((record) => Object.values(record).includes(filter.value));
 });
 
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
+const metrics = computed(() => [
+  records.value.length,
+  records.value.filter((record) => record.status === "营业中").length,
+  records.value.filter((record) => record.status === "库存不足").length
+]);
 
 const chartRows = computed(() => statuses.map((status) => ({
   status,
@@ -146,19 +199,110 @@ const chartRows = computed(() => statuses.map((status) => ({
 
 const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
 
+const recentLogs = computed(() => logs.value.slice(0, 5));
+
 function persist() {
   localStorage.setItem(project.storageKey, JSON.stringify(records.value));
 }
 
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
+function persistLogs() {
+  localStorage.setItem(logStorageKey, JSON.stringify(logs.value));
 }
 
 function primaryText(record: RecordItem) {
   const first = fields[0];
   const second = fields[1];
   return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
+}
+
+function formatTime(value?: string | number) {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function statusClass(status: string) {
+  return {
+    营业中: "is-open",
+    库存不足: "is-low",
+    补货中: "is-restocking",
+    暂停营业: "is-closed"
+  }[status] ?? "";
+}
+
+function availableActions(record: RecordItem) {
+  return transitions.filter((transition) => transition.from === record.status);
+}
+
+function addLog(record: RecordItem, transition: Transition) {
+  const now = Date.now();
+  const latest = logs.value[0];
+  // 幂等：同一处理的重复点击（同油站、同操作、同前后状态且间隔极短）只保留一条
+  if (
+    latest &&
+    latest.recordId === record.id &&
+    latest.action === transition.label &&
+    latest.from === transition.from &&
+    latest.to === transition.to &&
+    now - new Date(latest.time).getTime() < 2000
+  ) {
+    return;
+  }
+  logs.value = [
+    {
+      id: crypto.randomUUID(),
+      recordId: record.id,
+      station: String(record[fields[0].key] || project.entityLabel),
+      action: transition.label,
+      from: transition.from,
+      to: transition.to,
+      operator: operator.value.trim() || "值班员",
+      time: new Date(now).toISOString()
+    },
+    ...logs.value
+  ].slice(0, 100);
+  persistLogs();
+}
+
+function applyTransition(record: RecordItem, transition: Transition, extra?: () => void) {
+  // 幂等守卫：状态已变化（如重复点击、重复提交）时直接忽略，不重复变更也不重复记录
+  if (record.status !== transition.from) return;
+  extra?.();
+  record.status = transition.to;
+  addLog(record, transition);
+  persist();
+}
+
+function runAction(record: RecordItem, transition: Transition) {
+  if (transition.needsForm) {
+    openRestock(record);
+    return;
+  }
+  applyTransition(record, transition);
+}
+
+function openRestock(record: RecordItem) {
+  // 仅库存不足可登记补货，暂停营业不能开始补货
+  if (record.status !== "库存不足") return;
+  restockTarget.value = record;
+  restockForm.expectedArrival = "";
+  restockForm.manager = String(record.manager || operator.value);
+}
+
+function cancelRestock() {
+  restockTarget.value = null;
+}
+
+function confirmRestock() {
+  const record = restockTarget.value;
+  if (!record || !restockForm.expectedArrival || !restockForm.manager.trim()) return;
+  const transition = transitions.find((item) => item.key === "restock");
+  if (!transition) return;
+  applyTransition(record, transition, () => {
+    record.expectedArrival = restockForm.expectedArrival;
+    record.restockManager = restockForm.manager.trim();
+  });
+  restockTarget.value = null;
 }
 
 function submit() {
@@ -177,9 +321,8 @@ function submit() {
   persist();
 }
 
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
+function copySummary(record: RecordItem) {
+  navigator.clipboard?.writeText(primaryText(record));
 }
 
 function remove(id: string) {
@@ -232,6 +375,10 @@ function remove(id: string) {
         <section class="list-panel">
           <div class="toolbar">
             <h2>{{ project.entityLabel }}列表</h2>
+            <label class="operator-field">
+              操作人
+              <input v-model="operator" type="text" placeholder="值班员姓名" />
+            </label>
             <select v-model="filter">
               <option v-for="item in project.filters" :key="item">{{ item }}</option>
             </select>
@@ -242,16 +389,46 @@ function remove(id: string) {
             <article v-for="record in filteredRecords" :key="record.id" class="record">
               <div class="record-head">
                 <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
+                <span class="status" :class="statusClass(record.status)">{{ record.status }}</span>
               </div>
               <div class="details">
                 <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
               </div>
               <p class="note">{{ record.notes }}</p>
+              <p v-if="record.status === '补货中' && record.expectedArrival" class="restock-info">
+                预计到货：{{ formatTime(record.expectedArrival) }} ・ 补货负责人：{{ record.restockManager || "未填写" }}
+              </p>
               <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
+                <button
+                  v-for="action in availableActions(record)"
+                  :key="action.key"
+                  type="button"
+                  @click="runAction(record, action)"
+                >
+                  {{ action.label }}
+                </button>
+                <button class="secondary" type="button" @click="copySummary(record)">复制摘要</button>
                 <button class="danger" type="button" @click="remove(record.id)">删除</button>
+              </div>
+              <div v-if="restockTarget?.id === record.id" class="restock-form">
+                <label>
+                  预计到货时间
+                  <input v-model="restockForm.expectedArrival" type="datetime-local" />
+                </label>
+                <label>
+                  负责人
+                  <input v-model="restockForm.manager" type="text" placeholder="补货负责人" />
+                </label>
+                <div class="actions">
+                  <button
+                    type="button"
+                    :disabled="!restockForm.expectedArrival || !restockForm.manager.trim()"
+                    @click="confirmRestock"
+                  >
+                    确认登记
+                  </button>
+                  <button class="secondary" type="button" @click="cancelRestock">取消</button>
+                </div>
               </div>
             </article>
           </div>
@@ -262,6 +439,20 @@ function remove(id: string) {
               <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
               <strong>{{ row.value }}</strong>
             </div>
+          </div>
+
+          <div class="flow-log">
+            <h3>变更记录（最近5条）</h3>
+            <p v-if="recentLogs.length === 0" class="empty">暂无变更记录</p>
+            <ul v-else>
+              <li v-for="log in recentLogs" :key="log.id">
+                <span class="log-time">{{ formatTime(log.time) }}</span>
+                <span class="log-station">{{ log.station }}</span>
+                <span>{{ log.action }}</span>
+                <span class="log-status">{{ log.from }} → {{ log.to }}</span>
+                <span>操作人：{{ log.operator }}</span>
+              </li>
+            </ul>
           </div>
         </section>
       </section>
